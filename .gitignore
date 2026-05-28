@@ -1,0 +1,12 @@
+node_modules/
+docs/.observable/
+data/raw/
+data/build.log
+data/last_updated.json
+.claude/
+skills/
+settings.json
+settings.local.json
+template.html
+.playwright-mcp/
+CLAUDE.md
