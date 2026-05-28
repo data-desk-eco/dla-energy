@@ -75,10 +75,25 @@
     SELECT dest_installation_id AS inst_id,
            any_value(refinery_name(dest_installation)) AS refinery,
            origin_country,
-           ROUND(SUM(mass_t)/1000, 1) AS kt
+           ROUND(SUM(mass_t)/1000, 1) AS kt,
+           ROUND(SUM(mass_t * jet_yield(grade, origin_country))/1000, 1) AS jet_equiv_kt
     FROM crude_trades
     WHERE COALESCE(grade,'') != 'CPC Kazakhstan'
     GROUP BY 1, 3
+  </script>
+
+  <script id="capacity_sql" output="capacity" type="application/sql" database="../data/data.duckdb" hidden>
+    WITH win AS (
+      SELECT EXTRACT(EPOCH FROM (MAX("end") - MIN("end"))) / 31557600.0 AS years
+      FROM crude_trades
+    )
+    SELECT dest_installation_id AS inst_id,
+           any_value(dest_installation) AS name,
+           refinery_capacity_kt_yr(any_value(dest_installation)) AS annual_kt,
+           refinery_capacity_kt_yr(any_value(dest_installation)) * 0.85 * (SELECT years FROM win) AS expected_window_kt,
+           ROUND(SUM(mass_t)/1000, 1) AS observed_marine_kt
+    FROM crude_trades
+    GROUP BY 1
   </script>
 
   <script id="jet_in_sql" output="jet_in" type="application/sql" database="../data/data.duckdb" hidden>
@@ -113,9 +128,15 @@
     const refineryIds = new Set(dla_sites.filter(s => s.role === "refinery").map(s => s.installation_id));
     const dlaIds = new Set(dla_sites.map(s => s.installation_id));
 
-    const totalCrudeByInstId = d3.rollup(crude_in, v => d3.sum(v, d => d.kt), d => d.inst_id);
+    const totalCrudeByInstId = d3.rollup(crude_in, v => d3.sum(v, d => d.jet_equiv_kt), d => d.inst_id);
     const crudeByInstId = d3.group(crude_in, d => d.inst_id);
     const crudeNameById = new Map(crude_in.map(d => [d.inst_id, d.refinery]));
+    const capacityById = new Map(capacity.map(d => [d.inst_id, d]));
+    function marineShare(instId) {
+      const c = capacityById.get(instId);
+      if (!c || !c.expected_window_kt) return 1;
+      return Math.min(1, c.observed_marine_kt / c.expected_window_kt);
+    }
 
     // Jet inflows to terminals → upstream refineries.
     const upstreamByTerminalId = d3.group(jet_in.filter(d => terminalIds.has(d.dest_id)), d => d.dest_id);
@@ -123,6 +144,8 @@
     const jetInToRefineries = jet_in.filter(d => refineryIds.has(d.dest_id));
 
     const upstreamNameById = new Map(jet_in.map(d => [d.up_id, d.upstream]));
+    const destNameById = new Map(jet_in.map(d => [d.dest_id, d.dest_name]));
+    const dlaNameById = new Map(dla_sites.map(s => [s.installation_id, s.source_label]));
 
     function airportLabel(instId) {
       const a = refineryAirports.get(instId);
@@ -130,7 +153,11 @@
     }
 
     function refineryDisplay(instId) {
-      return crudeNameById.get(instId) || upstreamNameById.get(instId) || `installation ${instId}`;
+      return crudeNameById.get(instId)
+        || upstreamNameById.get(instId)
+        || destNameById.get(instId)
+        || dlaNameById.get(instId)
+        || `installation ${instId}`;
     }
 
     const links = [];
@@ -170,8 +197,8 @@
       const total = totalCrudeByInstId.get(instId) || 0;
       if (total <= 0) return 0;
       const rows = crudeByInstId.get(instId) || [];
-      const sanc = d3.sum(rows.filter(r => FLAGGED.has(r.origin_country)), r => r.kt);
-      return sanc / total;
+      const sanc = d3.sum(rows.filter(r => FLAGGED.has(r.origin_country)), r => r.jet_equiv_kt);
+      return (sanc / total) * marineShare(instId);
     }
 
     // 1. Sanctioned source → refinery (split by share of incoming crude)
@@ -198,7 +225,7 @@
       // To keep the chart legible, scale the inflow size to match the outflow size
       // (so we use refToTermTotal + directIn as the refinery node weight).
       const nodeWeight = (refineryIds.has(refId)
-        ? Math.max(totalCrude * 0.1, refToTermTotal + directIn || 0.1)
+        ? Math.max(totalCrude, refToTermTotal + directIn || 0.1)
         : refToTermTotal);
 
       if (nodeWeight <= 0) continue;
@@ -206,14 +233,18 @@
       if (totalCrude <= 0) {
         links.push({source: "Pipeline/unknown", target: refName, value: nodeWeight, _kind: "source-ref"});
       } else {
+        const ms = marineShare(refId);
         const byOrigin = new Map();
         for (const r of (crudeByInstId.get(refId) || [])) {
           const label = FLAGGED.has(r.origin_country) ? FLAG_LABEL[r.origin_country] : "Other seaborne crude";
-          byOrigin.set(label, (byOrigin.get(label) || 0) + r.kt);
+          byOrigin.set(label, (byOrigin.get(label) || 0) + r.jet_equiv_kt);
         }
         for (const [label, kt] of byOrigin) {
           const share = kt / totalCrude;
-          if (share > 0) links.push({source: label, target: refName, value: share * nodeWeight, _kind: "source-ref"});
+          if (share > 0) links.push({source: label, target: refName, value: share * nodeWeight * ms, _kind: "source-ref"});
+        }
+        if (ms < 1) {
+          links.push({source: "Pipeline/unknown", target: refName, value: nodeWeight * (1 - ms), _kind: "source-ref"});
         }
       }
 
@@ -436,17 +467,39 @@
   <script id="contracts_header" type="text/markdown">
     ## DLA Energy contract sites and their crude footprint
 
-    *Sanctioned %* below is sanctioned crude (Russia / Iran / Venezuela /
-    Sudan) as a share of *all* seaborne crude arriving at the refinery
-    since 1 January 2025 — it is not the share of any single jet cargo.
-    For storage terminals, the share is weighted by the upstream
-    refineries that supplied them.
+    *Jet attribution %* is the share of a refinery's notional jet output
+    that is attributable to Russian-, Iranian-, Venezuelan- or
+    Sudanese-origin crude. Cargoes are weighted by typical atmospheric
+    kerosene cut yield (Merey ≈6.5%, Urals ≈10.5%, Murban ≈13.5%,
+    Nile ≈14%) and then *scaled down by the share of the refinery's
+    nameplate throughput that Kpler's marine data can actually see* —
+    so US Gulf refineries with mostly-pipeline crude (CITGO, ExxonMobil
+    Baton Rouge, etc.) aren't treated as if their few visible cargoes
+    represent their whole slate. *Marine visibility %* is that scaling
+    factor. For storage terminals, attribution is weighted by the
+    upstream refineries that supplied the jet stored there.
   </script>
 
   <script id="sites_table_sql" output="sites_table" type="application/sql" database="../data/data.duckdb" hidden>
-    WITH crude_in AS (
+    WITH win AS (
+      SELECT EXTRACT(EPOCH FROM (MAX("end") - MIN("end"))) / 31557600.0 AS years
+      FROM crude_trades
+    ),
+    crude_in AS (
       SELECT dest_installation_id AS inst_id,
+             any_value(dest_installation) AS name,
+             SUM(mass_t)/1000 AS marine_crude_kt_raw,
              ROUND(SUM(mass_t)/1000, 1) AS crude_kt,
+             SUM(mass_t * jet_yield(grade, origin_country)) AS jet_equiv_mass,
+             SUM(CASE WHEN origin_country = 'Russian Federation'
+                       AND COALESCE(grade,'') != 'CPC Kazakhstan'
+                  THEN mass_t * jet_yield(grade, origin_country) END) AS russia_jet_equiv,
+             SUM(CASE WHEN origin_country = 'Iran'
+                  THEN mass_t * jet_yield(grade, origin_country) END) AS iran_jet_equiv,
+             SUM(CASE WHEN origin_country = 'Venezuela'
+                  THEN mass_t * jet_yield(grade, origin_country) END) AS venezuela_jet_equiv,
+             SUM(CASE WHEN origin_country = 'Sudan'
+                  THEN mass_t * jet_yield(grade, origin_country) END) AS sudan_jet_equiv,
              ROUND(SUM(CASE WHEN origin_country = 'Russian Federation'
                              AND COALESCE(grade,'') != 'CPC Kazakhstan'
                         THEN mass_t END)/1000, 1) AS russia_kt,
@@ -455,6 +508,17 @@
              ROUND(SUM(CASE WHEN origin_country = 'Sudan' THEN mass_t END)/1000, 1) AS sudan_kt
       FROM crude_trades
       GROUP BY 1
+    ),
+    crude_in_adj AS (
+      SELECT c.*,
+             refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win) AS expected_kt,
+             CASE
+               WHEN refinery_capacity_kt_yr(c.name) IS NULL THEN 1.0
+               WHEN refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win) <= 0 THEN 1.0
+               ELSE LEAST(1.0, c.marine_crude_kt_raw
+                              / (refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win)))
+             END AS marine_share
+      FROM crude_in c
     ),
     jet_in_dla AS (
       SELECT dest_installation_id AS inst_id,
@@ -467,12 +531,13 @@
       SELECT j.dest_installation_id AS inst_id,
              SUM(j.mass_t) AS up_total_mass,
              SUM(j.mass_t * COALESCE(
-                 CASE WHEN c.crude_kt > 0 THEN
-                   (COALESCE(c.russia_kt,0) + COALESCE(c.iran_kt,0)
-                    + COALESCE(c.venezuela_kt,0) + COALESCE(c.sudan_kt,0)) / c.crude_kt
+                 CASE WHEN c.jet_equiv_mass > 0 THEN
+                   ((COALESCE(c.russia_jet_equiv,0) + COALESCE(c.iran_jet_equiv,0)
+                    + COALESCE(c.venezuela_jet_equiv,0) + COALESCE(c.sudan_jet_equiv,0))
+                   / c.jet_equiv_mass) * c.marine_share
                  END, 0)) AS w_sanc
       FROM jet_trades j
-      LEFT JOIN crude_in c ON c.inst_id = j.origin_installation_id
+      LEFT JOIN crude_in_adj c ON c.inst_id = j.origin_installation_id
       WHERE j.origin_installation_id IS NOT NULL
       GROUP BY 1
     )
@@ -484,15 +549,17 @@
       ji.jet_n, ji.jet_kt,
       ci.crude_kt,
       ci.russia_kt, ci.iran_kt, ci.venezuela_kt, ci.sudan_kt,
+      ROUND(100.0 * ci.marine_share, 0) AS marine_visibility_pct,
       CASE
-        WHEN s.role = 'refinery' AND ci.crude_kt > 0
-          THEN ROUND(100.0 * (COALESCE(ci.russia_kt,0) + COALESCE(ci.iran_kt,0)
-                            + COALESCE(ci.venezuela_kt,0) + COALESCE(ci.sudan_kt,0)) / ci.crude_kt, 1)
+        WHEN s.role = 'refinery' AND ci.jet_equiv_mass > 0
+          THEN ROUND(100.0 * (COALESCE(ci.russia_jet_equiv,0) + COALESCE(ci.iran_jet_equiv,0)
+                            + COALESCE(ci.venezuela_jet_equiv,0) + COALESCE(ci.sudan_jet_equiv,0))
+                            / ci.jet_equiv_mass * ci.marine_share, 1)
         WHEN s.role = 'terminal' AND us.up_total_mass > 0
           THEN ROUND(100.0 * us.w_sanc / us.up_total_mass, 1)
       END AS sanc_pct
     FROM dla_sites s
-    LEFT JOIN crude_in ci ON ci.inst_id = s.installation_id
+    LEFT JOIN crude_in_adj ci ON ci.inst_id = s.installation_id
     LEFT JOIN jet_in_dla ji ON ji.inst_id = s.installation_id
     LEFT JOIN upstream_sanct us ON us.inst_id = s.installation_id
     ORDER BY sanc_pct DESC NULLS LAST
@@ -515,11 +582,12 @@
         "IR kt": r.iran_kt,
         "VE kt": r.venezuela_kt,
         "SD kt": r.sudan_kt,
-        "Sanctioned %": r.sanc_pct,
+        "Marine visibility %": r.marine_visibility_pct,
+        "Jet attribution %": r.sanc_pct,
       }));
     display(Inputs.table(rows, {
       rows: 40,
-      sort: "Sanctioned %", reverse: true,
+      sort: "Jet attribution %", reverse: true,
       width: {Refueler: 170, Airports: 180, Site: 220},
       format: {
         "Jet kt in": v => v == null ? "" : fmt1(v),
@@ -528,7 +596,8 @@
         "IR kt": v => v == null ? "" : fmt(v),
         "VE kt": v => v == null ? "" : fmt(v),
         "SD kt": v => v == null ? "" : fmt(v),
-        "Sanctioned %": v => v == null ? "" : fmt1(v) + "%",
+        "Marine visibility %": v => v == null ? "" : fmt(v) + "%",
+        "Jet attribution %": v => v == null ? "" : fmt1(v) + "%",
       },
     }));
     display(downloadCsv(rows, "dla-sites.csv"));
@@ -696,6 +765,35 @@
     Cargoes flagged as Russian-origin specifically exclude grade *CPC
     Kazakhstan*, a Kazakh-origin blend that loads at Russian Black Sea
     ports.
+
+    Each crude cargo is weighted by its typical atmospheric kerosene-cut
+    yield (in volume %), drawn from published assays. Light sweet
+    grades (Murban ≈13.5%, Sokol ≈14.5%, Sah Bl. ≈14.5%, Midland
+    ≈14%) and waxy Sudanese crudes (Nile ≈14%, Dar ≈13.5%) get more
+    weight per tonne than Russian Urals (≈10.5%), and far more than
+    Venezuelan Merey (≈6.5%) or Boscan (≈4%).
+
+    The number is then scaled down by *marine visibility*: each
+    refinery's observed marine crude over the window divided by its
+    expected throughput (nameplate × ~85% utilisation × window
+    years). Pipeline crude that Kpler doesn't see is assumed clean.
+    This matters a lot for US Gulf refineries — CITGO Lake Charles,
+    ExxonMobil Baton Rouge, Marathon Galveston Bay and so on get
+    most of their crude by pipeline from the Permian / Eagle Ford /
+    Bakken, so the few sanctioned cargoes we do see (e.g. CITGO's
+    licensed PDVSA Merey imports) should be attributed against the
+    whole barrel, not just the marine slice.
+
+    For a coastal Asian refinery like Reliance Jamnagar that imports
+    almost all its crude by sea, marine visibility is close to 100%
+    and the adjustment is small.
+
+    The result is an attribution bound — refineries running complex
+    units (Reliance Jamnagar's hydrocrackers, for example) can route
+    specific crude slates to specific product streams in ways the cut
+    weighting can't model — but it is a much more defensible
+    attribution than treating marine crude share as jet share
+    one-to-one.
 
     Six DLA contracts have no marine footprint and are listed separately
     (landlocked refineries in Nepal/Uzbekistan, pipeline-fed Zambia,

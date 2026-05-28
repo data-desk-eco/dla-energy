@@ -325,8 +325,226 @@ def main():
     n_crude = con.execute("SELECT COUNT(*) FROM crude_trades").fetchone()[0]
     print(f"  wrote crude_trades: {n_crude} rows")
 
-    # ---------------- Display-name macro (similar to HKIA notebook) ----------------
-    print("\n[3/3] Refinery display-name macro")
+    # ---------------- Refinery nameplate capacity macro ----------------
+    # Annual crude throughput at nameplate × ~85% utilisation, in kt/year.
+    # Used to estimate the share of a refinery's intake that Kpler's
+    # marine data can see vs the unobserved pipeline/domestic portion.
+    # US Gulf refineries are mostly pipeline-fed (Permian/Eagle Ford/
+    # Bakken light tight oil) — marine data captures <5% of their slate.
+    # Coastal Asian refineries (Reliance, Hengyi, Sinopec Hainan) are
+    # mostly marine. Numbers from EIA, IEA, JODI, company filings.
+    con.execute("""
+        CREATE OR REPLACE MACRO refinery_capacity_kt_yr(name) AS
+          CASE name
+            WHEN 'CITGO Lake Charles Refinery'   THEN 21100
+            WHEN 'ExxonMobil Baton Rouge Refinery' THEN 25900
+            WHEN 'Marathon Texas City Refinery'  THEN 31300
+            WHEN 'Valero Port Arthur Refinery'   THEN 19600
+            WHEN 'ExxonMobil Baytown Refinery'   THEN 29000
+            WHEN 'Motiva Port Arthur'            THEN 31900
+            WHEN 'Marathon Valero Refineries'    THEN 30000
+            WHEN 'Valero Bill E'                 THEN 16000
+            WHEN 'Valero Bill W'                 THEN 16000
+            WHEN 'Pointe-a-Pierre Refinery'      THEN 8000
+            WHEN 'Reficar Refinery'              THEN 8200
+            WHEN 'El Palito Refinery'            THEN 7000
+            WHEN 'Vertex Mobile'                 THEN 4000
+            WHEN 'MOH Corinth Refinery'          THEN 5800
+            WHEN 'Thessaloniki Refinery'         THEN 4500
+            WHEN 'Repsol Cartagena Refinery'     THEN 11000
+            WHEN 'Shell Pernis Refinery'         THEN 20000
+            WHEN 'BP Rotterdam'                  THEN 19000
+            WHEN 'Shell Europoort'               THEN 21000
+            WHEN 'Sasol Augusta'                 THEN 10000
+            WHEN 'Ineos Grangemouth Refinery'    THEN 10000
+            WHEN 'Jamnagar Refinery'             THEN 69500
+            WHEN 'Vadinar Refinery'              THEN 20100
+            WHEN 'New Mangalore Refinery'        THEN 15000
+            WHEN 'Haldia Terminal'               THEN 7700
+            WHEN 'BORL Jamnagar Oil Terminal'    THEN 6200
+            WHEN 'Hengyi Refinery'               THEN 6700
+            WHEN 'Dangote Refinery'              THEN 32300
+            WHEN 'Sinopec Hainan'                THEN 7940
+            WHEN 'Petronas Melaka Refinery'      THEN 8440
+            WHEN 'Tema Oil Refinery'             THEN 2235
+            WHEN 'Rayong IRPC Refinery'          THEN 10700
+            WHEN 'MIDOR Refinery'                THEN 4960
+            WHEN 'Mostorod Refinery I'           THEN 7050
+            WHEN 'Mostorod Refinery II'          THEN 3970
+            WHEN 'La Rabida'                     THEN 10900
+            WHEN 'Pertamina Dumai'               THEN 8440
+            WHEN 'Cilacap Refinery'              THEN 17400
+            WHEN 'NATREF Refinery'               THEN 5360
+            WHEN 'M''Bao Oil Refinery'           THEN 1490
+            WHEN 'Zarqa Refinery'                THEN 4470
+            WHEN 'Bizerte'                       THEN 1840
+            WHEN 'Lytton Refinery'               THEN 5410
+            WHEN 'MAF Refinery'                  THEN 5810
+            WHEN 'Petron Bataan Refinery'        THEN 8930
+            WHEN 'Sohar Refinery'                THEN 10900
+            WHEN 'Ruwais Refinery'               THEN 41700
+            WHEN 'Duqm Refinery'                 THEN 11200
+            WHEN 'Yanbu Refinery'                THEN 19500
+            WHEN 'Jubail Industrial Port'        THEN 19400
+            WHEN 'Petro Rabigh'                  THEN 19900
+            WHEN 'Sitra Refinery'                THEN 13900
+            WHEN 'MAA Refinery'                  THEN 24900
+            WHEN 'Marsa El Brega Refinery'       THEN 3500
+            WHEN 'El Nasr Refinery'              THEN 6000
+            WHEN 'Marifu Refinery'               THEN 6700
+            WHEN 'Nippon Mizushima Refinery A'   THEN 13800
+            WHEN 'Takaishi Osaka Refinery'       THEN 6100
+            WHEN 'KNOC Daesan'                   THEN 28800
+            WHEN 'Hyundai Daesan Refinery'       THEN 19400
+            WHEN 'S-Oil Onsan'                   THEN 33200
+            WHEN 'SK Ulsan'                      THEN 41700
+            WHEN 'KPIC Ulsan'                    THEN 13900
+            WHEN 'Aster Bukom'                   THEN 23800
+            WHEN 'Horizon SGP'                   THEN 7000
+            WHEN 'Tankstore'                     THEN 7000
+            WHEN 'Vopak Banyan'                  THEN 7000
+            WHEN 'Dalian'                        THEN 20100
+            WHEN 'Dalian Petrochemical'          THEN 10500
+            WHEN 'Sinopec Tianjin'               THEN 12500
+            WHEN 'Qingdao Huangdao'              THEN 8400
+            WHEN 'Jinzhou Port'                  THEN 6700
+            WHEN 'CNPC Qinzhou Refinery'         THEN 10500
+            WHEN 'Beilun Suansha'                THEN 27000
+            WHEN 'Sinopec Zhanjiang Zhongke Refinery' THEN 10500
+            WHEN 'Huizhou Refinery'              THEN 11800
+            WHEN 'Petrochina Jieyang Refinery'   THEN 20100
+            WHEN 'FREP Plant'                    THEN 12000
+            WHEN 'Port Dickson Refinery'         THEN 7400
+            WHEN 'Tanjung Bin Refinery'          THEN 9300
+            WHEN 'Luanda Refinery'               THEN 2300
+            ELSE NULL
+          END
+    """)
+
+    # ---------------- Per-grade jet yield macro ----------------
+    # Atmospheric-distillation kerosene/jet cut as a fraction of crude
+    # volume, drawn from published assays (BP, Equinor, ENI, ADNOC, S&P
+    # Platts). Used as a relative weight when attributing a refinery's
+    # jet output to its crude inputs by origin — so heavy Venezuelan or
+    # Canadian crudes (low jet cut) contribute less to the "jet barrel"
+    # than light sweet Murban or ESPO.
+    #
+    # These are simple atmospheric cuts; deep-conversion refineries (e.g.
+    # Reliance Jamnagar) lift the absolute jet yield via hydrocracking,
+    # but the relative weighting between grades still holds.
+    print("\n[3/3] Per-grade jet yield + refinery display-name macros")
+    con.execute("""
+        CREATE OR REPLACE MACRO jet_yield(grade, country) AS
+          CASE
+            WHEN grade = 'Urals'                THEN 0.105
+            WHEN grade = 'ESPO'                 THEN 0.125
+            WHEN grade = 'Sokol'                THEN 0.145
+            WHEN grade = 'SBL'                  THEN 0.125
+            WHEN grade = 'ARCO'                 THEN 0.090
+            WHEN grade = 'Varandey'             THEN 0.105
+            WHEN grade = 'KEBCO'                THEN 0.105
+            WHEN grade = 'Western Russia Crude' THEN 0.105
+            WHEN grade = 'Novy Port'            THEN 0.100
+            WHEN grade = 'Kaliningrad'          THEN 0.110
+            WHEN grade = 'Sak Bl.'              THEN 0.125
+            WHEN grade = 'CPC Russia'           THEN 0.110
+            WHEN grade = 'CPC'                  THEN 0.110
+            WHEN grade = 'CPC Kazakhstan'       THEN 0.110
+            WHEN grade = 'Iran'                 THEN 0.100
+            WHEN grade = 'Lavan'                THEN 0.130
+            WHEN grade = 'Sirri'                THEN 0.110
+            WHEN grade = 'South Pars Co.'       THEN 0.500
+            WHEN grade = 'Nile'                 THEN 0.140
+            WHEN grade = 'Dar'                  THEN 0.135
+            WHEN grade = 'Dar/Nile Crude'       THEN 0.140
+            WHEN grade = 'Merey'                THEN 0.065
+            WHEN grade = 'Boscan'               THEN 0.040
+            WHEN grade = 'Hamaca'               THEN 0.060
+            WHEN grade = 'Venezuela Crude'      THEN 0.060
+            WHEN grade = 'Arab Lt.'             THEN 0.115
+            WHEN grade = 'Arab XLt.'            THEN 0.125
+            WHEN grade = 'Arab M'               THEN 0.100
+            WHEN grade = 'Arab Hy.'             THEN 0.085
+            WHEN grade = 'Arab'                 THEN 0.105
+            WHEN grade = 'Khafji'               THEN 0.090
+            WHEN grade = 'Shaheen'              THEN 0.100
+            WHEN grade = 'Murban'               THEN 0.135
+            WHEN grade = 'Zakum'                THEN 0.125
+            WHEN grade = 'Das'                  THEN 0.130
+            WHEN grade = 'Kuwait'               THEN 0.105
+            WHEN grade = 'Basrah Med.'          THEN 0.095
+            WHEN grade = 'Basrah Hy.'           THEN 0.080
+            WHEN grade = 'Oman'                 THEN 0.105
+            WHEN grade = 'Johan Sverdrup'       THEN 0.080
+            WHEN grade = 'Midland'              THEN 0.140
+            WHEN grade = 'Bonny Lt.'            THEN 0.130
+            WHEN grade = 'Tupi'                 THEN 0.110
+            WHEN grade = 'Buzios'               THEN 0.105
+            WHEN grade = 'Mero'                 THEN 0.110
+            WHEN grade = 'Sepia'                THEN 0.110
+            WHEN grade = 'Atapu'                THEN 0.105
+            WHEN grade = 'Sururu'               THEN 0.105
+            WHEN grade = 'Peregrino'            THEN 0.065
+            WHEN grade = 'Maya'                 THEN 0.060
+            WHEN grade = 'Pacific Dilbit'       THEN 0.045
+            WHEN grade = 'Cold Lake blend'      THEN 0.045
+            WHEN grade = 'TMX'                  THEN 0.050
+            WHEN grade = 'Djeno'                THEN 0.095
+            WHEN grade = 'Kimanis'              THEN 0.135
+            WHEN grade = 'APAC'                 THEN 0.125
+            WHEN grade = 'Champion'             THEN 0.130
+            WHEN grade = 'Seria Lt.'            THEN 0.140
+            WHEN grade = 'Sah Bl.'              THEN 0.145
+            WHEN grade = 'Algeria Co.'          THEN 0.500
+            WHEN grade = 'Doba Blend'           THEN 0.090
+            WHEN grade = 'Lokele'               THEN 0.100
+            WHEN grade = 'Dalia'                THEN 0.095
+            WHEN grade = 'Pazflor'              THEN 0.085
+            WHEN grade = 'Mostarda'             THEN 0.100
+            WHEN grade = 'Nemba'                THEN 0.100
+            WHEN grade = 'Palanca'              THEN 0.125
+            WHEN grade = 'Kissanje'             THEN 0.110
+            WHEN grade = 'Clov'                 THEN 0.110
+            WHEN grade = 'Hungo'                THEN 0.100
+            WHEN grade = 'Girassol'             THEN 0.115
+            WHEN grade = 'Cabinda'              THEN 0.115
+            WHEN country = 'Russian Federation' THEN 0.105
+            WHEN country = 'Iran'               THEN 0.100
+            WHEN country = 'Venezuela'          THEN 0.060
+            WHEN country = 'Sudan'              THEN 0.135
+            WHEN country = 'Saudi Arabia'       THEN 0.105
+            WHEN country = 'United Arab Emirates' THEN 0.130
+            WHEN country = 'Iraq'               THEN 0.090
+            WHEN country = 'Kuwait'             THEN 0.105
+            WHEN country = 'Oman'               THEN 0.105
+            WHEN country = 'Qatar'              THEN 0.130
+            WHEN country = 'Brazil'             THEN 0.105
+            WHEN country = 'United States'      THEN 0.135
+            WHEN country = 'Nigeria'            THEN 0.120
+            WHEN country = 'Norway'             THEN 0.095
+            WHEN country = 'Canada'             THEN 0.050
+            WHEN country = 'Mexico'             THEN 0.070
+            WHEN country = 'Angola'             THEN 0.105
+            WHEN country = 'Algeria'            THEN 0.140
+            WHEN country = 'Egypt'              THEN 0.105
+            WHEN country = 'Argentina'          THEN 0.120
+            WHEN country = 'Indonesia'          THEN 0.110
+            WHEN country = 'Malaysia'           THEN 0.125
+            WHEN country = 'Brunei'             THEN 0.130
+            WHEN country = 'China'              THEN 0.110
+            WHEN country = 'Cameroon'           THEN 0.095
+            WHEN country = 'Colombia'           THEN 0.080
+            WHEN country = 'Ecuador'            THEN 0.080
+            WHEN country = 'Gabon'              THEN 0.105
+            WHEN country = 'Libya'              THEN 0.135
+            WHEN country = 'Equatorial Guinea'  THEN 0.110
+            WHEN country = 'Congo'              THEN 0.095
+            WHEN country = 'Ghana'              THEN 0.110
+            WHEN country = 'Guyana'             THEN 0.110
+            WHEN country = 'Mauritania'         THEN 0.105
+            ELSE 0.110
+          END
+    """)
     con.execute("""
         CREATE OR REPLACE MACRO refinery_name(name) AS
           CASE name
