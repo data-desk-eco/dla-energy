@@ -18,8 +18,9 @@
     Defense Logistics Agency Energy (DLA Energy). Each contract names a
     *fuel source* — the refinery or storage depot the supplier draws from.
     For a provided subset of contracts, we trace the crude oil feeding that source, counting
-    only the oil that arrived while the contract was running (our shipping
-    data starts on 1 January 2025). We flag any crude from a country on
+    only the oil that arrived while the contract was running — across each
+    contract's full period of performance, the earliest beginning in
+    August 2023. We flag any crude from a country on
     [AML Global's sanctions policy](https://files.amlglobal.net/Sanctions.pdf):
     Russia, Belarus, Cuba, Iran, Syria, North Korea, Myanmar, Sudan or
     Venezuela.
@@ -45,10 +46,6 @@
 
   <script id="dla_sites_sql" output="dla_sites" type="application/sql" database="../data/data.duckdb" hidden>
     SELECT * FROM dla_sites
-  </script>
-
-  <script id="dla_untracked_sql" output="dla_untracked" type="application/sql" database="../data/data.duckdb" hidden>
-    SELECT * FROM dla_untracked
   </script>
 
   <script id="crude_in_sql" output="crude_in" type="application/sql" database="../data/data.duckdb" hidden>
@@ -598,27 +595,6 @@
     display(downloadCsv(rows, "dla-sites.csv"));
   </script>
 
-  <script id="untracked_header" type="text/markdown">
-    ### Contracts with no seaborne footprint
-
-    These sites don't show up in shipping data — they are landlocked,
-    fed by pipeline, or no longer operating.
-  </script>
-
-  <script id="untracked_table" type="module">
-    display(Inputs.table(dla_untracked.map(r => ({
-      Refueler: r.refueler,
-      Airport: r.airports,
-      Source: r.source_label,
-      Location: r.location_label,
-      Country: r.country_code,
-      Note: r.note,
-    })), {
-      rows: 10,
-      width: {Refueler: 170, Source: 230, Note: 360},
-    }));
-  </script>
-
   <script id="sanctioned_header" type="text/markdown">
     ### Every sanctioned-origin cargo
 
@@ -626,6 +602,14 @@
     Iran, Syria, North Korea, Myanmar, Sudan or Venezuela) that arrived at a
     contract refinery — or at a refinery supplying a contract depot — during
     the contract period. Kazakh CPC blend is excluded.
+
+    > **Flag — two Iranian cargoes to verify.** The only Iranian-origin
+    > crude here is two NIOC cargoes loaded at Kharg Island: one to Reliance
+    > Jamnagar (Apr 2026, *Felicity*) and one to Petron Bataan (May 2026,
+    > *KYLO*). Both ride tankers whose voyage histories otherwise run Iran →
+    > China, and Indian/Philippine refiners have long avoided NIOC crude.
+    > These destination attributions may be unreliable and warrant
+    > independent confirmation before being treated as fact.
   </script>
 
   <script id="sanctioned_sql" output="sanctioned" type="application/sql" database="../data/data.duckdb" hidden>
@@ -747,15 +731,25 @@
     Each refinery or depot named in a DLA Energy contract is matched to its
     shipping record in [Kpler](https://www.kpler.com/), a commodity-tracking
     service. We count the crude oil (and, for depots, the jet fuel) that
-    arrived by sea while the contract was active — starting from
-    1 January 2025, where our data begins.
+    arrived by sea over each contract's full period of performance — the
+    earliest running from August 2023.
 
     Different crude grades yield different amounts of jet fuel, so each
     cargo is weighted by its grade's typical jet yield. We then scale by the
     proportion of a refinery's oil that arrives by sea and can therefore be
-    tracked. A refinery fed mostly by pipeline (common on the US Gulf coast)
-    has little of its supply visible, and the oil we can't see is treated as
-    clean. Cargoes of Kazakh CPC blend — which loads at Russian ports but is
-    not Russian oil — are not counted as sanctioned.
+    tracked: we compare the crude we observe arriving by ship against the
+    refinery's nameplate capacity. A refinery fed mostly by pipeline (common
+    on the US Gulf coast) has little of its supply visible, and the oil we
+    can't see is treated as clean. Cargoes of Kazakh CPC blend — which loads
+    at Russian ports but is not Russian oil — are not counted as sanctioned.
+
+    We only treat a site as a refinery if it appears in our refinery
+    reference table, whose capacities come from Wikipedia's
+    [list of oil refineries](https://en.wikipedia.org/wiki/List_of_oil_refineries)
+    (supplemented, where that list is silent, by named industry sources — one
+    citation per refinery). When a contract depot is fed by sea from a plain
+    storage or blending terminal rather than a refinery, that supply is a
+    pass-through we cannot trace to crude, so it is shown as unattributed
+    rather than guessed at.
   </script>
 </notebook>

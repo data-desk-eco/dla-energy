@@ -1,7 +1,7 @@
 """Build the AML Global / DLA Energy contract investigation database.
 
 For each "Fuel Source Location" named in the DLA Energy contract spreadsheet,
-pull jet-fuel arrivals (since 2025-01-01) and — for refineries — the upstream
+pull jet-fuel arrivals (back to each contract's start) and — for refineries — the upstream
 crude. For sites that are storage / transshipment terminals the jet inflows
 reveal which refineries fed them, and we pull crude into those refineries too.
 """
@@ -26,9 +26,10 @@ XLSX = DATA / "DLA Energy - AML Contracts.xlsx"
 
 JET_PRODUCT = 1644
 CRUDE_GROUP = 1370
-SINCE = datetime(2025, 1, 1)
-DATA_FLOOR = datetime(2025, 1, 1)  # earliest seaborne data we hold
 TODAY = datetime.now()
+# DATA_FLOOR / SINCE are derived from the earliest contract start (see below,
+# once DLA_CONTRACT_WINDOW is defined) so every contract is pulled and counted
+# from its first day, as far back as Kpler's record extends.
 PAGE = 500
 MAX_OFFSET = 9500
 
@@ -36,7 +37,7 @@ MAX_OFFSET = 9500
 # spreadsheet (MM/DD/YYYY in the source, ISO here). Where one installation
 # serves two contracts (Petron Bataan: Davao + Zamboanga) the window is the
 # union. Crude/jet flows are only counted while a contract was live — clipped
-# to the data we hold (from 2025-01-01) and to today.
+# to the earliest contract start (DATA_FLOOR, below) and to today.
 DLA_CONTRACT_WINDOW = {
     1676:  ("2026-04-01", "2029-03-31"),  # ATT Tanjung Bin → Pago Pago
     1308:  ("2025-08-01", "2029-09-30"),  # Lytton → Canberra/Townsville
@@ -65,6 +66,11 @@ DLA_CONTRACT_WINDOW = {
     4341:  ("2024-02-01", "2027-09-30"),  # STIR Bizerte → Tunis
     1384:  ("2025-08-01", "2029-09-30"),  # Sinopec Hainan → Noi Bai
 }
+
+# Earliest contract start across all installations — the floor for both the
+# Kpler pull and the window clipping, so each contract is covered from day one.
+DATA_FLOOR = min(datetime.fromisoformat(s) for s, _ in DLA_CONTRACT_WINDOW.values())
+SINCE = DATA_FLOOR
 
 
 def clip_window(start_iso: str, end_iso: str) -> tuple[datetime, datetime]:
@@ -154,6 +160,44 @@ UNTRACKED = [
         "PACIFIC ENERGY AVIATION", "Jacksons / Port Moresby",
         "Napa Napa refinery shut 2024; only LPG terminal on Kpler"),
 ]
+
+
+# ----------------------------------------------------------------------------
+# Refinery registry — the single source of truth for "what is a refinery".
+#
+# Loaded from data/sources/refinery_capacity.csv (built by build_capacity.py
+# from Wikipedia's "List of oil refineries" plus named gap sources, one
+# citation per row). Keyed by the raw Kpler installation name, valued by
+# nameplate crude throughput in kt/year. This registry does two jobs:
+#
+#   1. It defines the universe of installations we treat as refineries. Crude
+#      is attributed *only* to names in this map. A DLA depot's jet that
+#      arrives from anything not here (a tank farm such as FOTT / Fujairah,
+#      Pengerang DIT, Advario Antwerp, Shuaiba, ADM, Solvay) is a pass-through
+#      we cannot trace, and is shown as "unattributed upstream" rather than
+#      having a tank farm's incoming crude imputed onto it.
+#
+#   2. Its capacity sizes each refinery's expected throughput, so we can
+#      estimate the share of its crude intake that seaborne data can see
+#      (marine visibility) versus the unobserved pipeline/domestic portion.
+#
+# Because every analysed refinery is in this map by construction, marine
+# visibility is always defined — there is no "unknown capacity, assume fully
+# visible" fallback.
+CAPACITY_CSV = DATA / "sources" / "refinery_capacity.csv"
+
+
+def load_refinery_capacity() -> dict[str, int]:
+    import csv
+    if not CAPACITY_CSV.exists():
+        sys.exit(f"missing {CAPACITY_CSV}; run: "
+                 f"uv run --with requests scripts/build_capacity.py")
+    with CAPACITY_CSV.open() as f:
+        return {r["kpler_name"]: int(r["capacity_kt_yr"])
+                for r in csv.DictReader(f)}
+
+
+REFINERY_CAPACITY_KT_YR = load_refinery_capacity()
 
 
 def kpler_trades(*, scope_flag: str, scope_id: int, products: int | None,
@@ -258,7 +302,11 @@ def write_table(con, name: str, rows: list[dict]) -> None:
     con.execute(f"CREATE TABLE {name} AS SELECT * FROM read_json_auto('{raw_path}')")
     con.execute(f"ALTER TABLE {name} ALTER start TYPE TIMESTAMP USING start::TIMESTAMP")
     con.execute(f"ALTER TABLE {name} ALTER \"end\" TYPE TIMESTAMP USING \"end\"::TIMESTAMP")
-    con.execute(f"DELETE FROM {name} WHERE start < TIMESTAMP '2025-01-01'")
+    con.execute(f"DELETE FROM {name} WHERE start < TIMESTAMP '{DATA_FLOOR.isoformat()}'")
+    # Drop self-loops (origin == destination installation): intra-site / STS
+    # moves, not an inflow from elsewhere, and they break the Sankey as cycles.
+    con.execute(f"DELETE FROM {name} "
+                f"WHERE origin_installation_id = dest_installation_id")
 
 
 def load_contracts() -> list[dict]:
@@ -338,14 +386,19 @@ def main():
             terminal_ids.add(iid)
 
     # Storage terminals: trace one step upstream via jet inflows to identify
-    # the refineries that supplied them, and pull crude there too.
+    # the refineries that supplied them, and pull crude there too. We only
+    # follow origins that are in the refinery registry — jet arriving from a
+    # tank farm or blending terminal (FOTT, Pengerang DIT, Advario, …) is a
+    # pass-through we cannot trace to crude, so it is left unattributed.
     upstream_from_terminals: dict[int, str] = {}
     for row in jet_flat:
         if row.get("dest_installation_id") in terminal_ids:
             up_id = row.get("origin_installation_id")
             up_name = row.get("origin_installation")
-            if up_id and up_id not in refinery_targets and up_id not in upstream_from_terminals:
-                upstream_from_terminals[up_id] = up_name or f"installation {up_id}"
+            if (up_id and up_name in REFINERY_CAPACITY_KT_YR
+                    and up_id not in refinery_targets
+                    and up_id not in upstream_from_terminals):
+                upstream_from_terminals[up_id] = up_name
 
     crude_targets = {**refinery_targets, **upstream_from_terminals}
     print(f"\n[2/3] Crude inflows to {len(crude_targets)} refineries "
@@ -385,7 +438,7 @@ def main():
         if tid not in term_win:
             continue
         up = row.get("origin_installation_id")
-        if not up:
+        if not up or row.get("origin_installation") not in REFINERY_CAPACITY_KT_YR:
             continue
         ws, we = term_win[tid]
         end = row.get("end")
@@ -444,97 +497,21 @@ def main():
           f"crude {n_crude} → {n_crude2}")
 
     # ---------------- Refinery nameplate capacity macro ----------------
-    # Annual crude throughput at nameplate × ~85% utilisation, in kt/year.
-    # Used to estimate the share of a refinery's intake that Kpler's
-    # marine data can see vs the unobserved pipeline/domestic portion.
-    # US Gulf refineries are mostly pipeline-fed (Permian/Eagle Ford/
-    # Bakken light tight oil) — marine data captures <5% of their slate.
-    # Coastal Asian refineries (Reliance, Hengyi, Sinopec Hainan) are
-    # mostly marine. Numbers from EIA, IEA, JODI, company filings.
-    con.execute("""
+    # Generated from REFINERY_CAPACITY_KT_YR (the refinery registry). Annual
+    # crude throughput at nameplate, in kt/year, used to size each refinery's
+    # expected intake so we can estimate the share visible to seaborne data
+    # (marine visibility) versus the unobserved pipeline/domestic portion.
+    # Coastal refineries (Reliance, Hengyi) are mostly marine; US Gulf
+    # refineries (CITGO, ExxonMobil Baton Rouge) are largely pipeline-fed, so
+    # marine data sees only a small slice of their slate. Numbers from EIA,
+    # IEA, JODI and company filings.
+    cap_cases = "\n".join(
+        f"            WHEN '{n.replace(chr(39), chr(39) * 2)}' THEN {kt}"
+        for n, kt in REFINERY_CAPACITY_KT_YR.items())
+    con.execute(f"""
         CREATE OR REPLACE MACRO refinery_capacity_kt_yr(name) AS
           CASE name
-            WHEN 'CITGO Lake Charles Refinery'   THEN 21100
-            WHEN 'ExxonMobil Baton Rouge Refinery' THEN 25900
-            WHEN 'Marathon Texas City Refinery'  THEN 31300
-            WHEN 'Valero Port Arthur Refinery'   THEN 19600
-            WHEN 'ExxonMobil Baytown Refinery'   THEN 29000
-            WHEN 'Motiva Port Arthur'            THEN 31900
-            WHEN 'Marathon Valero Refineries'    THEN 30000
-            WHEN 'Valero Bill E'                 THEN 16000
-            WHEN 'Valero Bill W'                 THEN 16000
-            WHEN 'Pointe-a-Pierre Refinery'      THEN 8000
-            WHEN 'Reficar Refinery'              THEN 8200
-            WHEN 'El Palito Refinery'            THEN 7000
-            WHEN 'Vertex Mobile'                 THEN 4000
-            WHEN 'MOH Corinth Refinery'          THEN 5800
-            WHEN 'Thessaloniki Refinery'         THEN 4500
-            WHEN 'Repsol Cartagena Refinery'     THEN 11000
-            WHEN 'Shell Pernis Refinery'         THEN 20000
-            WHEN 'BP Rotterdam'                  THEN 19000
-            WHEN 'Shell Europoort'               THEN 21000
-            WHEN 'Sasol Augusta'                 THEN 10000
-            WHEN 'Ineos Grangemouth Refinery'    THEN 10000
-            WHEN 'Jamnagar Refinery'             THEN 69500
-            WHEN 'Vadinar Refinery'              THEN 20100
-            WHEN 'New Mangalore Refinery'        THEN 15000
-            WHEN 'Haldia Terminal'               THEN 7700
-            WHEN 'BORL Jamnagar Oil Terminal'    THEN 6200
-            WHEN 'Hengyi Refinery'               THEN 6700
-            WHEN 'Dangote Refinery'              THEN 32300
-            WHEN 'Sinopec Hainan'                THEN 7940
-            WHEN 'Petronas Melaka Refinery'      THEN 8440
-            WHEN 'Tema Oil Refinery'             THEN 2235
-            WHEN 'Rayong IRPC Refinery'          THEN 10700
-            WHEN 'MIDOR Refinery'                THEN 4960
-            WHEN 'Mostorod Refinery I'           THEN 7050
-            WHEN 'Mostorod Refinery II'          THEN 3970
-            WHEN 'La Rabida'                     THEN 10900
-            WHEN 'Pertamina Dumai'               THEN 8440
-            WHEN 'Cilacap Refinery'              THEN 17400
-            WHEN 'NATREF Refinery'               THEN 5360
-            WHEN 'M''Bao Oil Refinery'           THEN 1490
-            WHEN 'Zarqa Refinery'                THEN 4470
-            WHEN 'Bizerte'                       THEN 1840
-            WHEN 'Lytton Refinery'               THEN 5410
-            WHEN 'MAF Refinery'                  THEN 5810
-            WHEN 'Petron Bataan Refinery'        THEN 8930
-            WHEN 'Sohar Refinery'                THEN 10900
-            WHEN 'Ruwais Refinery'               THEN 41700
-            WHEN 'Duqm Refinery'                 THEN 11200
-            WHEN 'Yanbu Refinery'                THEN 19500
-            WHEN 'Jubail Industrial Port'        THEN 19400
-            WHEN 'Petro Rabigh'                  THEN 19900
-            WHEN 'Sitra Refinery'                THEN 13900
-            WHEN 'MAA Refinery'                  THEN 24900
-            WHEN 'Marsa El Brega Refinery'       THEN 3500
-            WHEN 'El Nasr Refinery'              THEN 6000
-            WHEN 'Marifu Refinery'               THEN 6700
-            WHEN 'Nippon Mizushima Refinery A'   THEN 13800
-            WHEN 'Takaishi Osaka Refinery'       THEN 6100
-            WHEN 'KNOC Daesan'                   THEN 28800
-            WHEN 'Hyundai Daesan Refinery'       THEN 19400
-            WHEN 'S-Oil Onsan'                   THEN 33200
-            WHEN 'SK Ulsan'                      THEN 41700
-            WHEN 'KPIC Ulsan'                    THEN 13900
-            WHEN 'Aster Bukom'                   THEN 23800
-            WHEN 'Horizon SGP'                   THEN 7000
-            WHEN 'Tankstore'                     THEN 7000
-            WHEN 'Vopak Banyan'                  THEN 7000
-            WHEN 'Dalian'                        THEN 20100
-            WHEN 'Dalian Petrochemical'          THEN 10500
-            WHEN 'Sinopec Tianjin'               THEN 12500
-            WHEN 'Qingdao Huangdao'              THEN 8400
-            WHEN 'Jinzhou Port'                  THEN 6700
-            WHEN 'CNPC Qinzhou Refinery'         THEN 10500
-            WHEN 'Beilun Suansha'                THEN 27000
-            WHEN 'Sinopec Zhanjiang Zhongke Refinery' THEN 10500
-            WHEN 'Huizhou Refinery'              THEN 11800
-            WHEN 'Petrochina Jieyang Refinery'   THEN 20100
-            WHEN 'FREP Plant'                    THEN 12000
-            WHEN 'Port Dickson Refinery'         THEN 7400
-            WHEN 'Tanjung Bin Refinery'          THEN 9300
-            WHEN 'Luanda Refinery'               THEN 2300
+{cap_cases}
             ELSE NULL
           END
     """)
@@ -571,7 +548,7 @@ def main():
             WHEN grade = 'Iran'                 THEN 0.100
             WHEN grade = 'Lavan'                THEN 0.130
             WHEN grade = 'Sirri'                THEN 0.110
-            WHEN grade = 'South Pars Co.'       THEN 0.500
+            WHEN grade = 'South Pars Co.'       THEN 0.130
             WHEN grade = 'Nile'                 THEN 0.140
             WHEN grade = 'Dar'                  THEN 0.135
             WHEN grade = 'Dar/Nile Crude'       THEN 0.140
@@ -613,7 +590,7 @@ def main():
             WHEN grade = 'Champion'             THEN 0.130
             WHEN grade = 'Seria Lt.'            THEN 0.140
             WHEN grade = 'Sah Bl.'              THEN 0.145
-            WHEN grade = 'Algeria Co.'          THEN 0.500
+            WHEN grade = 'Algeria Co.'          THEN 0.130
             WHEN grade = 'Doba Blend'           THEN 0.090
             WHEN grade = 'Lokele'               THEN 0.100
             WHEN grade = 'Dalia'                THEN 0.095
