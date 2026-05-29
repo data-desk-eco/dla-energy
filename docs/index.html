@@ -132,17 +132,18 @@
     const destNameById = new Map(jet_in.map(d => [d.dest_id, d.dest_name]));
     const dlaNameById = new Map(dla_sites.map(s => [s.installation_id, s.source_label]));
 
-    function airportLabel(instId) {
-      const a = refineryAirports.get(instId);
-      return a ? a : "(no airport)";
-    }
-
     function refineryDisplay(instId) {
-      return crudeNameById.get(instId)
+      const base = crudeNameById.get(instId)
         || upstreamNameById.get(instId)
         || destNameById.get(instId)
         || dlaNameById.get(instId)
         || `installation ${instId}`;
+      // For a DLA contract site, name the airport(s) it supplies in brackets —
+      // e.g. "Kipevu (Mombasa Moi; JKIA Nairobi)". We deliberately do not draw
+      // a flow onward to the airport: the source serves many other customers
+      // and uplift is overland, so any such bar would be misleading.
+      const ap = dlaIds.has(instId) ? refineryAirports.get(instId) : null;
+      return ap ? `${base} (${ap})` : base;
     }
 
     const links = [];
@@ -238,13 +239,8 @@
         const tName = refineryDisplay(tid);
         links.push({source: refName, target: tName, value: kt, _kind: "ref-term"});
       }
-
-      // DLA-refinery → airport (for refineries that are themselves the DLA source).
-      if (refineryIds.has(refId)) {
-        const airport = airportLabel(refId);
-        // We size this to the refinery node weight (so the bar matches in/out).
-        links.push({source: refName, target: airport, value: nodeWeight, _kind: "ref-airport"});
-      }
+      // A DLA refinery is itself the contract source — the chain ends here.
+      // We do not draw a flow onward to the airport (named in the node label).
     }
 
     // Add "Unknown upstream" → terminal where no jet-inflow data attributes the source.
@@ -252,11 +248,7 @@
       if (e.unknown > 0) {
         links.push({source: "Unknown upstream", target: e.terminalName, value: e.unknown, _kind: "source-ref"});
       }
-      // DLA-terminal → airport
-      const airport = airportLabel(e.tid);
-      const tName = e.terminalName;
-      const inSize = d3.sum([...e.contrib.values()]) + e.unknown;
-      if (inSize > 0) links.push({source: tName, target: airport, value: inSize, _kind: "term-airport"});
+      // The DLA terminal is the contract source — the chain ends here too.
     }
 
     // Sanctioned-share lookup for the filter.
@@ -302,13 +294,9 @@
     const knownLeft = new Set(sourceOrder);
     const terminalNames = new Set(terminalSankeyEntries.map(e => e.terminalName));
     const refineryNames = [...allRefIds].map(refineryDisplay).filter(n => merged.some(d => d.source === n || d.target === n));
-    const allTargets = new Set(merged.map(d => d.target));
-    const airportNames = [...new Set([...refineryIds, ...terminalIds].map(airportLabel))]
-      .filter(a => allTargets.has(a));
-
     const terminalActive = [...terminalNames].filter(n => merged.some(d => d.source === n || d.target === n));
 
-    const nodeNames = [...sourceOrder, ...refineryNames, ...terminalActive, ...airportNames]
+    const nodeNames = [...sourceOrder, ...refineryNames, ...terminalActive]
       .filter(n => merged.some(d => d.source === n || d.target === n));
     const nodeMap = new Map(nodeNames.map((name, i) => [name, i]));
 
@@ -322,13 +310,12 @@
     };
 
     const chartWidth = Math.min(width, 1200);
-    const chartHeight = Math.max(500, Math.max(refineryNames.length, airportNames.length) * 24);
+    const chartHeight = Math.max(500, Math.max(refineryNames.length, terminalActive.length) * 24);
     const margin = {top: 8, right: 8, bottom: 8, left: 8};
 
     function fixedAlign(node, n) {
       if (sourceOrder.includes(node.name)) return 0;
       if (terminalNames.has(node.name)) return 2;
-      if (airportNames.includes(node.name)) return 3;
       return 1;
     }
 
@@ -355,11 +342,8 @@
       "Pipeline/unknown": "#444",
       "Unknown upstream": "#444",
     };
-    const destBase = "#1f77b4";
-
     function nodeColor(d) {
       if (sourceColor[d.name]) return sourceColor[d.name];
-      if (airportNames.includes(d.name)) return destBase;
       if (terminalNames.has(d.name)) return "#5a6b7a";
       const inc = d.targetLinks || [];
       const total = d3.sum(inc, l => l.value);
@@ -606,10 +590,10 @@
     > **Flag — two Iranian cargoes to verify.** The only Iranian-origin
     > crude here is two NIOC cargoes loaded at Kharg Island: one to Reliance
     > Jamnagar (Apr 2026, *Felicity*) and one to Petron Bataan (May 2026,
-    > *KYLO*). Both ride tankers whose voyage histories otherwise run Iran →
-    > China, and Indian/Philippine refiners have long avoided NIOC crude.
-    > These destination attributions may be unreliable and warrant
-    > independent confirmation before being treated as fact.
+    > *KYLO*). Both tankers almost always carry Iranian crude to China, and
+    > Indian and Philippine refiners have long steered clear of NIOC barrels.
+    > We can't yet confirm these two deliveries landed where the data says
+    > they did, so we haven't relied on them.
   </script>
 
   <script id="sanctioned_sql" output="sanctioned" type="application/sql" database="../data/data.duckdb" hidden>
