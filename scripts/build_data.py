@@ -27,8 +27,51 @@ XLSX = DATA / "DLA Energy - AML Contracts.xlsx"
 JET_PRODUCT = 1644
 CRUDE_GROUP = 1370
 SINCE = datetime(2025, 1, 1)
+DATA_FLOOR = datetime(2025, 1, 1)  # earliest seaborne data we hold
+TODAY = datetime.now()
 PAGE = 500
 MAX_OFFSET = 9500
+
+# Contract Period of Performance per Kpler installation, from the DLA Energy
+# spreadsheet (MM/DD/YYYY in the source, ISO here). Where one installation
+# serves two contracts (Petron Bataan: Davao + Zamboanga) the window is the
+# union. Crude/jet flows are only counted while a contract was live — clipped
+# to the data we hold (from 2025-01-01) and to today.
+DLA_CONTRACT_WINDOW = {
+    1676:  ("2026-04-01", "2029-03-31"),  # ATT Tanjung Bin → Pago Pago
+    1308:  ("2025-08-01", "2029-09-30"),  # Lytton → Canberra/Townsville
+    1685:  ("2024-10-21", "2026-09-30"),  # Ocean Point Products → Bridgetown
+    2097:  ("2024-10-21", "2026-09-30"),  # Ocean Point → Bridgetown
+    7038:  ("2024-02-01", "2027-09-30"),  # NATREF → Gaborone
+    6782:  ("2025-08-01", "2029-09-30"),  # Hengyi → Brunei
+    1554:  ("2024-02-01", "2027-09-30"),  # Vopak Europoort → Amilcar Cabral
+    9617:  ("2025-06-01", "2028-05-31"),  # Mostorod I → Cairo
+    9709:  ("2025-06-01", "2028-05-31"),  # Mostorod II → Cairo
+    1782:  ("2024-02-01", "2027-09-30"),  # Tema → Kotoka
+    2187:  ("2025-08-01", "2029-09-30"),  # Dumai → Soekarno-Hatta
+    9595:  ("2025-06-01", "2028-05-31"),  # JOPETROL Zarqa → Marka/Aqaba
+    1672:  ("2025-06-01", "2028-05-31"),  # Aqaba Terminal → Marka/Aqaba
+    1369:  ("2023-12-01", "2027-09-30"),  # Kipevu → Mombasa/JKIA
+    6798:  ("2025-06-01", "2028-05-31"),  # MIDOR → Beirut
+    1344:  ("2025-08-01", "2029-09-30"),  # Petronas Melaka → Kuala Lumpur
+    1247:  ("2024-02-01", "2027-09-30"),  # Cepsa Huelva → Rabat
+    1266:  ("2024-01-01", "2027-09-30"),  # Reliance Jamnagar → Abuja
+    2385:  ("2025-06-01", "2028-05-31"),  # OQ MAF Refinery → Muscat
+    1355:  ("2025-06-01", "2028-05-31"),  # OQ MAF terminal → Muscat
+    4720:  ("2023-08-01", "2029-09-30"),  # Petron Bataan → Davao + Zamboanga
+    11317: ("2025-10-01", "2029-03-31"),  # Dangote → San Juan
+    1246:  ("2024-02-01", "2027-09-30"),  # SAR M'Bao → Dakar
+    1374:  ("2025-06-02", "2030-06-01"),  # IRPC Rayong → Phuket
+    4341:  ("2024-02-01", "2027-09-30"),  # STIR Bizerte → Tunis
+    1384:  ("2025-08-01", "2029-09-30"),  # Sinopec Hainan → Noi Bai
+}
+
+
+def clip_window(start_iso: str, end_iso: str) -> tuple[datetime, datetime]:
+    """Clip a contract window to the data we actually hold."""
+    s = max(datetime.fromisoformat(start_iso), DATA_FLOOR)
+    e = min(datetime.fromisoformat(end_iso), TODAY)
+    return s, e
 
 # Manually mapped from the DLA spreadsheet's (Source, Fuel Source Location)
 # columns to Kpler installation IDs. Landlocked sites (Barauni, Fergana,
@@ -249,7 +292,9 @@ def main():
     sites_rows = [
         {"installation_id": iid, "role": role, "source_label": src,
          "location_label": loc, "country_code": cc, "refueler": ref,
-         "airports": ap}
+         "airports": ap,
+         "period_start": DLA_CONTRACT_WINDOW[iid][0],
+         "period_end": DLA_CONTRACT_WINDOW[iid][1]}
         for (iid, role, src, loc, cc, ref, ap) in DLA_SITES
     ]
     untracked_rows = [
@@ -324,6 +369,79 @@ def main():
     write_table(con, "crude_trades", crude_flat)
     n_crude = con.execute("SELECT COUNT(*) FROM crude_trades").fetchone()[0]
     print(f"  wrote crude_trades: {n_crude} rows")
+
+    # ---------------- Clip both tables to contract periods ----------------
+    # Jet dests are DLA-listed sites — use the site's own contract window.
+    jet_win = {iid: clip_window(*DLA_CONTRACT_WINDOW[iid])
+               for iid in DLA_CONTRACT_WINDOW}
+    term_win = {iid: jet_win[iid] for iid in terminal_ids}
+
+    # Upstream refineries feeding a DLA terminal inherit that terminal's
+    # window (union across terminals they feed), counting only jet that
+    # actually arrived while the terminal contract was live.
+    upstream_win: dict[int, tuple[datetime, datetime]] = {}
+    for row in jet_flat:
+        tid = row.get("dest_installation_id")
+        if tid not in term_win:
+            continue
+        up = row.get("origin_installation_id")
+        if not up:
+            continue
+        ws, we = term_win[tid]
+        end = row.get("end")
+        end_dt = datetime.fromisoformat(end[:19]) if end else None
+        if end_dt is None or end_dt < ws or end_dt > we:
+            continue
+        if up in upstream_win:
+            s0, e0 = upstream_win[up]
+            upstream_win[up] = (min(s0, ws), max(e0, we))
+        else:
+            upstream_win[up] = (ws, we)
+
+    # Crude dests: a DLA refinery uses its own window; an upstream refinery
+    # uses its inherited terminal window. An installation that is both
+    # (e.g. Reliance feeds both Abuja directly and Ocean Point) gets the union.
+    crude_win: dict[int, tuple[datetime, datetime]] = {}
+    for iid in refinery_targets:
+        if iid in jet_win:
+            crude_win[iid] = jet_win[iid]
+    for up, (ws, we) in upstream_win.items():
+        if up in crude_win:
+            s0, e0 = crude_win[up]
+            crude_win[up] = (min(s0, ws), max(e0, we))
+        else:
+            crude_win[up] = (ws, we)
+
+    def windows_table(name: str, win: dict[int, tuple[datetime, datetime]]):
+        rows = [{"inst_id": iid,
+                 "win_start": s.isoformat(), "win_end": e.isoformat(),
+                 "win_years": max((e - s).days, 0) / 365.25}
+                for iid, (s, e) in win.items()]
+        (RAW / f"{name}.json").write_text(json.dumps(rows))
+        con.execute(f"DROP TABLE IF EXISTS {name}")
+        con.execute(f"CREATE TABLE {name} AS SELECT * FROM read_json_auto('{RAW / f'{name}.json'}')")
+        con.execute(f"ALTER TABLE {name} ALTER win_start TYPE TIMESTAMP USING win_start::TIMESTAMP")
+        con.execute(f"ALTER TABLE {name} ALTER win_end TYPE TIMESTAMP USING win_end::TIMESTAMP")
+
+    windows_table("jet_windows", jet_win)
+    windows_table("crude_windows", crude_win)
+
+    con.execute("""
+        DELETE FROM jet_trades j WHERE NOT EXISTS (
+          SELECT 1 FROM jet_windows w
+          WHERE w.inst_id = j.dest_installation_id
+            AND j."end" >= w.win_start AND j."end" <= w.win_end)
+    """)
+    con.execute("""
+        DELETE FROM crude_trades c WHERE NOT EXISTS (
+          SELECT 1 FROM crude_windows w
+          WHERE w.inst_id = c.dest_installation_id
+            AND c."end" >= w.win_start AND c."end" <= w.win_end)
+    """)
+    n_jet2 = con.execute("SELECT COUNT(*) FROM jet_trades").fetchone()[0]
+    n_crude2 = con.execute("SELECT COUNT(*) FROM crude_trades").fetchone()[0]
+    print(f"  clipped to contract periods: jet {n_jet} → {n_jet2}, "
+          f"crude {n_crude} → {n_crude2}")
 
     # ---------------- Refinery nameplate capacity macro ----------------
     # Annual crude throughput at nameplate × ~85% utilisation, in kt/year.

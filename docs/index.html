@@ -14,23 +14,15 @@
   </script>
 
   <script id="intro" type="text/markdown">
-    The US Defense Logistics Agency Energy (DLA-E) buys jet fuel at airports
-    around the world under named contracts. Each contract identifies the
-    *Fuel Source Location* — the refinery or storage terminal that the
-    contracted *Refueler* lifts product from. The list below was compiled
-    from DLA-E award documents for 31 overseas civil airports across 28
-    countries.
-
-    AML Global (registered in Hong Kong) holds one of these contracts:
-    Bridgetown, Barbados, lifted from Ocean Point Terminals on St Croix in
-    the US Virgin Islands. AML's Hong Kong head office is not itself an
-    operational fuelling site.
-
-    For each Fuel Source Location that has any seaborne footprint, the
-    chart below traces the jet fuel arriving there since 1 January 2025
-    and — for the refineries that produce it — the crude oil arriving
-    there over the same period. Russian-, Iranian-, Venezuelan- and
-    Sudanese-origin crude is flagged.
+    The US military buys jet fuel at airports around the world through the
+    Defense Logistics Agency Energy (DLA Energy). Each contract names a
+    *fuel source* — the refinery or storage depot the supplier draws from.
+    For a provided subset of contracts, we trace the crude oil feeding that source, counting
+    only the oil that arrived while the contract was running (our shipping
+    data starts on 1 January 2025). We flag any crude from a country on
+    [AML Global's sanctions policy](https://files.amlglobal.net/Sanctions.pdf):
+    Russia, Belarus, Cuba, Iran, Syria, North Korea, Myanmar, Sudan or
+    Venezuela.
   </script>
 
   <script id="download_helper" type="module" hidden>
@@ -59,18 +51,6 @@
     SELECT * FROM dla_untracked
   </script>
 
-  <script id="contracts_sql" output="contracts" type="application/sql" database="../data/data.duckdb" hidden>
-    SELECT
-      "Country" AS country,
-      "Airport" AS airport,
-      "Parent Award" AS award,
-      "Refueler" AS refueler,
-      "Source" AS source,
-      "Fuel Source Location" AS source_location,
-      "Period of Performance" AS period
-    FROM contracts
-  </script>
-
   <script id="crude_in_sql" output="crude_in" type="application/sql" database="../data/data.duckdb" hidden>
     SELECT dest_installation_id AS inst_id,
            any_value(refinery_name(dest_installation)) AS refinery,
@@ -83,16 +63,13 @@
   </script>
 
   <script id="capacity_sql" output="capacity" type="application/sql" database="../data/data.duckdb" hidden>
-    WITH win AS (
-      SELECT EXTRACT(EPOCH FROM (MAX("end") - MIN("end"))) / 31557600.0 AS years
-      FROM crude_trades
-    )
-    SELECT dest_installation_id AS inst_id,
-           any_value(dest_installation) AS name,
-           refinery_capacity_kt_yr(any_value(dest_installation)) AS annual_kt,
-           refinery_capacity_kt_yr(any_value(dest_installation)) * 0.85 * (SELECT years FROM win) AS expected_window_kt,
-           ROUND(SUM(mass_t)/1000, 1) AS observed_marine_kt
-    FROM crude_trades
+    SELECT c.dest_installation_id AS inst_id,
+           any_value(c.dest_installation) AS name,
+           refinery_capacity_kt_yr(any_value(c.dest_installation)) AS annual_kt,
+           refinery_capacity_kt_yr(any_value(c.dest_installation)) * 0.85 * any_value(w.win_years) AS expected_window_kt,
+           ROUND(SUM(c.mass_t)/1000, 1) AS observed_marine_kt
+    FROM crude_trades c
+    LEFT JOIN crude_windows w ON w.inst_id = c.dest_installation_id
     GROUP BY 1
   </script>
 
@@ -109,17 +86,28 @@
   </script>
 
   <script id="filter_input" type="module">
-    const sancFilter = view(Inputs.toggle({label: "Filter to sanctioned-origin flows", value: false}));
+    const filterSet = view(Inputs.checkbox(
+      ["Filter to sanctioned-origin flows", "Filter out Jamnagar"],
+      {value: []}
+    ));
   </script>
 
   <script id="sankey_chart" type="module">
-    const FLAGGED = new Set(["Russian Federation", "Iran", "Venezuela", "Sudan"]);
+    // AML Global sanctions policy, Tables 1 + 2 (fuel-sourcing prohibition).
+    const sancFilter = filterSet.includes("Filter to sanctioned-origin flows");
+    const hideJamnagar = filterSet.includes("Filter out Jamnagar");
     const FLAG_LABEL = {
       "Russian Federation": "Russia",
+      "Belarus": "Belarus",
+      "Cuba": "Cuba",
       "Iran": "Iran",
-      "Venezuela": "Venezuela",
+      "Syria": "Syria",
+      "North Korea": "North Korea",
+      "Myanmar": "Myanmar",
       "Sudan": "Sudan",
+      "Venezuela": "Venezuela",
     };
+    const FLAGGED = new Set(Object.keys(FLAG_LABEL));
 
     const refineryRoles = new Map(dla_sites.map(s => [s.installation_id, s.role]));
     const refineryRefueler = d3.rollup(dla_sites, v => Array.from(new Set(v.map(d => d.refueler))).join(" / "), d => d.installation_id);
@@ -285,8 +273,8 @@
       termSanctShare.set(e.terminalName, weighted);
     }
 
-    const sourceOrder = ["Russia", "Iran", "Venezuela", "Sudan", "Other seaborne crude", "Pipeline/unknown", "Unknown upstream"];
-    const sancOrigins = new Set(["Russia", "Iran", "Venezuela", "Sudan"]);
+    const sancOrigins = new Set(Object.values(FLAG_LABEL));
+    const sourceOrder = [...sancOrigins, "Other seaborne crude", "Pipeline/unknown", "Unknown upstream"];
 
     // Filtering.
     const refNameSet = new Set([...allRefIds].map(refineryDisplay));
@@ -305,7 +293,11 @@
       return [l];
     });
 
-    const merged = d3.rollups(filtered, v => d3.sum(v, d => d.value), d => d.source, d => d.target)
+    const jamFiltered = hideJamnagar
+      ? filtered.filter(l => !String(l.source).includes("Jamnagar") && !String(l.target).includes("Jamnagar"))
+      : filtered;
+
+    const merged = d3.rollups(jamFiltered, v => d3.sum(v, d => d.value), d => d.source, d => d.target)
       .flatMap(([s, ts]) => ts.map(([t, v]) => ({source: s, target: t, value: v})))
       .filter(d => d.value > 0.1);
 
@@ -354,9 +346,14 @@
 
     const sourceColor = {
       "Russia": "#d62728",
+      "Belarus": "#8c564b",
+      "Cuba": "#bcbd22",
       "Iran": "#9467bd",
-      "Venezuela": "#ff7f0e",
+      "Syria": "#17becf",
+      "North Korea": "#7f7f7f",
+      "Myanmar": "#2ca02c",
       "Sudan": "#e377c2",
+      "Venezuela": "#ff7f0e",
       "Other seaborne crude": "#6c757d",
       "Pipeline/unknown": "#444",
       "Unknown upstream": "#444",
@@ -465,32 +462,28 @@
   </script>
 
   <script id="contracts_header" type="text/markdown">
-    ## DLA Energy contract sites and their crude footprint
+    ## Contract sites and their crude footprint
 
-    *Jet attribution %* is the share of a refinery's notional jet output
-    that is attributable to Russian-, Iranian-, Venezuelan- or
-    Sudanese-origin crude. Cargoes are weighted by typical atmospheric
-    kerosene cut yield (Merey ≈6.5%, Urals ≈10.5%, Murban ≈13.5%,
-    Nile ≈14%) and then *scaled down by the share of the refinery's
-    nameplate throughput that Kpler's marine data can actually see* —
-    so US Gulf refineries with mostly-pipeline crude (CITGO, ExxonMobil
-    Baton Rouge, etc.) aren't treated as if their few visible cargoes
-    represent their whole slate. *Marine visibility %* is that scaling
-    factor. For storage terminals, attribution is weighted by the
-    upstream refineries that supplied the jet stored there.
+    *Sanctioned %* estimates how much of each refinery's jet fuel traces
+    back to sanctioned crude during the contract period. It weights each
+    cargo by how much jet fuel its crude grade typically yields, then
+    adjusts for the *proportion of crude arriving by sea*, where we can
+    track it (oil arriving by pipeline is assumed clean). For storage
+    depots, the figure reflects the refineries that supplied them.
   </script>
 
   <script id="sites_table_sql" output="sites_table" type="application/sql" database="../data/data.duckdb" hidden>
-    WITH win AS (
-      SELECT EXTRACT(EPOCH FROM (MAX("end") - MIN("end"))) / 31557600.0 AS years
-      FROM crude_trades
-    ),
-    crude_in AS (
+    WITH crude_in AS (
       SELECT dest_installation_id AS inst_id,
              any_value(dest_installation) AS name,
+             any_value(w.win_years) AS win_years,
              SUM(mass_t)/1000 AS marine_crude_kt_raw,
              ROUND(SUM(mass_t)/1000, 1) AS crude_kt,
              SUM(mass_t * jet_yield(grade, origin_country)) AS jet_equiv_mass,
+             SUM(CASE WHEN origin_country IN ('Russian Federation','Belarus','Cuba','Iran',
+                                              'Syria','North Korea','Myanmar','Sudan','Venezuela')
+                       AND COALESCE(grade,'') != 'CPC Kazakhstan'
+                  THEN mass_t * jet_yield(grade, origin_country) END) AS sanc_jet_equiv,
              SUM(CASE WHEN origin_country = 'Russian Federation'
                        AND COALESCE(grade,'') != 'CPC Kazakhstan'
                   THEN mass_t * jet_yield(grade, origin_country) END) AS russia_jet_equiv,
@@ -507,16 +500,17 @@
              ROUND(SUM(CASE WHEN origin_country = 'Venezuela' THEN mass_t END)/1000, 1) AS venezuela_kt,
              ROUND(SUM(CASE WHEN origin_country = 'Sudan' THEN mass_t END)/1000, 1) AS sudan_kt
       FROM crude_trades
+      LEFT JOIN crude_windows w ON w.inst_id = crude_trades.dest_installation_id
       GROUP BY 1
     ),
     crude_in_adj AS (
       SELECT c.*,
-             refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win) AS expected_kt,
+             refinery_capacity_kt_yr(c.name) * 0.85 * c.win_years AS expected_kt,
              CASE
                WHEN refinery_capacity_kt_yr(c.name) IS NULL THEN 1.0
-               WHEN refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win) <= 0 THEN 1.0
+               WHEN refinery_capacity_kt_yr(c.name) * 0.85 * c.win_years <= 0 THEN 1.0
                ELSE LEAST(1.0, c.marine_crude_kt_raw
-                              / (refinery_capacity_kt_yr(c.name) * 0.85 * (SELECT years FROM win)))
+                              / (refinery_capacity_kt_yr(c.name) * 0.85 * c.win_years))
              END AS marine_share
       FROM crude_in c
     ),
@@ -532,9 +526,7 @@
              SUM(j.mass_t) AS up_total_mass,
              SUM(j.mass_t * COALESCE(
                  CASE WHEN c.jet_equiv_mass > 0 THEN
-                   ((COALESCE(c.russia_jet_equiv,0) + COALESCE(c.iran_jet_equiv,0)
-                    + COALESCE(c.venezuela_jet_equiv,0) + COALESCE(c.sudan_jet_equiv,0))
-                   / c.jet_equiv_mass) * c.marine_share
+                   (COALESCE(c.sanc_jet_equiv,0) / c.jet_equiv_mass) * c.marine_share
                  END, 0)) AS w_sanc
       FROM jet_trades j
       LEFT JOIN crude_in_adj c ON c.inst_id = j.origin_installation_id
@@ -546,14 +538,14 @@
       refinery_name(s.source_label) AS site,
       s.role,
       s.country_code AS country,
+      s.period_start, s.period_end,
       ji.jet_n, ji.jet_kt,
       ci.crude_kt,
       ci.russia_kt, ci.iran_kt, ci.venezuela_kt, ci.sudan_kt,
       ROUND(100.0 * ci.marine_share, 0) AS marine_visibility_pct,
       CASE
         WHEN s.role = 'refinery' AND ci.jet_equiv_mass > 0
-          THEN ROUND(100.0 * (COALESCE(ci.russia_jet_equiv,0) + COALESCE(ci.iran_jet_equiv,0)
-                            + COALESCE(ci.venezuela_jet_equiv,0) + COALESCE(ci.sudan_jet_equiv,0))
+          THEN ROUND(100.0 * COALESCE(ci.sanc_jet_equiv,0)
                             / ci.jet_equiv_mass * ci.marine_share, 1)
         WHEN s.role = 'terminal' AND us.up_total_mass > 0
           THEN ROUND(100.0 * us.w_sanc / us.up_total_mass, 1)
@@ -566,6 +558,8 @@
   </script>
 
   <script id="sites_table_render" type="module">
+    const sancFilter = filterSet.includes("Filter to sanctioned-origin flows");
+    const monthYear = d => d3.utcFormat("%b %Y")(new Date(d));
     const fmt = d3.format(",.0f");
     const fmt1 = d3.format(",.1f");
     const rows = sites_table
@@ -576,19 +570,20 @@
         Site: r.site,
         Kind: r.role,
         Country: r.country,
+        "Contract period": `${monthYear(r.period_start)} – ${monthYear(r.period_end)}`,
         "Jet kt in": r.jet_kt,
         "Crude kt in": r.crude_kt,
         "RU kt": r.russia_kt,
         "IR kt": r.iran_kt,
         "VE kt": r.venezuela_kt,
         "SD kt": r.sudan_kt,
-        "Marine visibility %": r.marine_visibility_pct,
-        "Jet attribution %": r.sanc_pct,
+        "Crude arriving by sea %": r.marine_visibility_pct,
+        "Sanctioned %": r.sanc_pct,
       }));
     display(Inputs.table(rows, {
       rows: 40,
-      sort: "Jet attribution %", reverse: true,
-      width: {Refueler: 170, Airports: 180, Site: 220},
+      sort: "Sanctioned %", reverse: true,
+      width: {Refueler: 170, Airports: 180, Site: 220, "Contract period": 150},
       format: {
         "Jet kt in": v => v == null ? "" : fmt1(v),
         "Crude kt in": v => v == null ? "" : fmt(v),
@@ -596,19 +591,18 @@
         "IR kt": v => v == null ? "" : fmt(v),
         "VE kt": v => v == null ? "" : fmt(v),
         "SD kt": v => v == null ? "" : fmt(v),
-        "Marine visibility %": v => v == null ? "" : fmt(v) + "%",
-        "Jet attribution %": v => v == null ? "" : fmt1(v) + "%",
+        "Crude arriving by sea %": v => v == null ? "" : fmt(v) + "%",
+        "Sanctioned %": v => v == null ? "" : fmt1(v) + "%",
       },
     }));
     display(downloadCsv(rows, "dla-sites.csv"));
   </script>
 
   <script id="untracked_header" type="text/markdown">
-    ### DLA contracts with no realistic seaborne footprint
+    ### Contracts with no seaborne footprint
 
-    Six DLA contracts cover supply chains that don't appear in Kpler's
-    marine data — landlocked refineries, pipeline-fed sites, or storage
-    facilities at shut-down refineries.
+    These sites don't show up in shipping data — they are landlocked,
+    fed by pipeline, or no longer operating.
   </script>
 
   <script id="untracked_table" type="module">
@@ -626,13 +620,12 @@
   </script>
 
   <script id="sanctioned_header" type="text/markdown">
-    ### Individual sanctioned-origin crude cargoes
+    ### Every sanctioned-origin cargo
 
-    Every cargo of Russian, Iranian, Venezuelan or Sudanese crude
-    discharging at a DLA-listed refinery (or at the upstream refineries
-    that supplied DLA-listed storage terminals) since 1 January 2025.
-    CPC Kazakhstan grade — Kazakh-origin blend that loads at Russian
-    Black Sea ports — is excluded.
+    Each shipment of crude from a sanctioned country (Russia, Belarus, Cuba,
+    Iran, Syria, North Korea, Myanmar, Sudan or Venezuela) that arrived at a
+    contract refinery — or at a refinery supplying a contract depot — during
+    the contract period. Kazakh CPC blend is excluded.
   </script>
 
   <script id="sanctioned_sql" output="sanctioned" type="application/sql" database="../data/data.duckdb" hidden>
@@ -656,7 +649,8 @@
       grade
     FROM crude_trades
     WHERE dest_installation_id IN (SELECT inst_id FROM r)
-      AND origin_country IN ('Iran', 'Venezuela', 'Sudan', 'Russian Federation')
+      AND origin_country IN ('Russian Federation','Belarus','Cuba','Iran',
+                             'Syria','North Korea','Myanmar','Sudan','Venezuela')
       AND COALESCE(grade,'') != 'CPC Kazakhstan'
     ORDER BY arrived DESC
   </script>
@@ -693,7 +687,7 @@
   </script>
 
   <script id="jet_header" type="text/markdown">
-    ### Individual jet-fuel cargoes into DLA-listed sites
+    ### Every jet-fuel cargo into a contract site
   </script>
 
   <script id="jet_cargoes_sql" output="jet_cargoes" type="application/sql" database="../data/data.duckdb" hidden>
@@ -750,54 +744,18 @@
   <script id="methodology" type="text/markdown">
     ## Methodology
 
-    Contract details from DLA Energy award documents (SPE60725D0001, D0035,
-    D0080, D0082, D0120, D0167, SPE60726D0053, SPE60723D0105). For each
-    *Fuel Source Location* we identified the corresponding
-    [Kpler](https://www.kpler.com/) installation by name, then pulled every
-    seaborne trade record discharging there since 1 January 2025.
+    Each refinery or depot named in a DLA Energy contract is matched to its
+    shipping record in [Kpler](https://www.kpler.com/), a commodity-tracking
+    service. We count the crude oil (and, for depots, the jet fuel) that
+    arrived by sea while the contract was active — starting from
+    1 January 2025, where our data begins.
 
-    For sites classified as *refinery* the crude inflows are read directly.
-    For *terminals* (Ocean Point St Croix, ATT Tanjung Bin, Kipevu, Aqaba,
-    Vopak Europoort, OQ Mina Al Fahal terminal), jet inflows identify the
-    upstream refineries that supplied the stored product; crude is then
-    pulled for each of those.
-
-    Cargoes flagged as Russian-origin specifically exclude grade *CPC
-    Kazakhstan*, a Kazakh-origin blend that loads at Russian Black Sea
-    ports.
-
-    Each crude cargo is weighted by its typical atmospheric kerosene-cut
-    yield (in volume %), drawn from published assays. Light sweet
-    grades (Murban ≈13.5%, Sokol ≈14.5%, Sah Bl. ≈14.5%, Midland
-    ≈14%) and waxy Sudanese crudes (Nile ≈14%, Dar ≈13.5%) get more
-    weight per tonne than Russian Urals (≈10.5%), and far more than
-    Venezuelan Merey (≈6.5%) or Boscan (≈4%).
-
-    The number is then scaled down by *marine visibility*: each
-    refinery's observed marine crude over the window divided by its
-    expected throughput (nameplate × ~85% utilisation × window
-    years). Pipeline crude that Kpler doesn't see is assumed clean.
-    This matters a lot for US Gulf refineries — CITGO Lake Charles,
-    ExxonMobil Baton Rouge, Marathon Galveston Bay and so on get
-    most of their crude by pipeline from the Permian / Eagle Ford /
-    Bakken, so the few sanctioned cargoes we do see (e.g. CITGO's
-    licensed PDVSA Merey imports) should be attributed against the
-    whole barrel, not just the marine slice.
-
-    For a coastal Asian refinery like Reliance Jamnagar that imports
-    almost all its crude by sea, marine visibility is close to 100%
-    and the adjustment is small.
-
-    The result is an attribution bound — refineries running complex
-    units (Reliance Jamnagar's hydrocrackers, for example) can route
-    specific crude slates to specific product streams in ways the cut
-    weighting can't model — but it is a much more defensible
-    attribution than treating marine crude share as jet share
-    one-to-one.
-
-    Six DLA contracts have no marine footprint and are listed separately
-    (landlocked refineries in Nepal/Uzbekistan, pipeline-fed Zambia,
-    shut-down SAMIR Mohammedia in Morocco, Tanzanian downstream storage,
-    Napa Napa Port Moresby refinery shut in 2024).
+    Different crude grades yield different amounts of jet fuel, so each
+    cargo is weighted by its grade's typical jet yield. We then scale by the
+    proportion of a refinery's oil that arrives by sea and can therefore be
+    tracked. A refinery fed mostly by pipeline (common on the US Gulf coast)
+    has little of its supply visible, and the oil we can't see is treated as
+    clean. Cargoes of Kazakh CPC blend — which loads at Russian ports but is
+    not Russian oil — are not counted as sanctioned.
   </script>
 </notebook>
